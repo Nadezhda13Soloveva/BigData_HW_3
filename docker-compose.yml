@@ -1,0 +1,126 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres_db
+    environment:
+      POSTGRES_DB: bigdata
+      POSTGRES_USER: bigdata
+      POSTGRES_PASSWORD: bigdata123
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-scripts:/docker-entrypoint-initdb.d
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bigdata -d bigdata"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  jobmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: flink_jobmanager
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        parallelism.default: 2
+    command: jobmanager
+    volumes:
+      - ./flink-job/target:/opt/flink/jobs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  taskmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: flink_taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 2
+    command: taskmanager
+    volumes:
+      - ./flink-job/target:/opt/flink/jobs
+
+  kafka-producer:
+    # build: ./kafka-producer
+    image: python:3.9-slim
+    container_name: kafka_producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./исходные_данные:/app/data:ro
+      - ./kafka-producer/producer.py:/app/producer.py:ro
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: mock_data_topic
+      DATA_DIR: /app/data
+    command: >
+      sh -c "
+        pip install kafka-python &&
+        python /app/producer.py
+      "
+
+  flink-job-submitter:
+    image: curlimages/curl:latest
+    container_name: flink_job_submitter
+    depends_on:
+      kafka-producer:
+        condition: service_completed_successfully
+      jobmanager:
+        condition: service_healthy
+    volumes:
+      - ./flink-job/target:/opt/flink/jobs:ro
+      - ./wait-and-submit.sh:/tmp/wait-and-submit.sh:ro
+    command: >
+      sh /tmp/wait-and-submit.sh
+
+volumes:
+  postgres_data:
